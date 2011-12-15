@@ -1248,7 +1248,9 @@ _evhtp_connection_accept(evbase_t * evbase, evhtp_connection_t * connection) {
 
     connection->bev = bufferevent_socket_new(evbase, connection->sock,
                                              BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+#ifndef DISABLE_SSL
 end:
+#endif
 
     bufferevent_set_timeouts(connection->bev,
                              connection->htp->recv_timeo,
@@ -1299,9 +1301,11 @@ _evhtp_connection_new(evhtp_t * htp, int sock) {
     return connection;
 }
 
+#ifndef DISABLE_SSL
 static void
 _evhtp_shutdown_eventcb(evbev_t * bev, short events, void * arg) {
 }
+#endif
 
 static void
 _evhtp_connection_free(evhtp_connection_t * connection) {
@@ -1324,11 +1328,13 @@ _evhtp_connection_free(evhtp_connection_t * connection) {
 #ifdef LIBEVENT_HAS_SHUTDOWN
         bufferevent_shutdown(connection->bev, _evhtp_shutdown_eventcb);
 #else
+#ifndef DISABLE_SSL
         if (connection->ssl_ctx != NULL) {
             SSL_set_shutdown(connection->ssl_ctx,
                              SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
             SSL_shutdown(connection->ssl_ctx);
         }
+#endif
         bufferevent_free(connection->bev);
 #endif
     }
