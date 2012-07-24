@@ -13,8 +13,7 @@
 #include <unistd.h>
 #include <pthread.h>
 
-#include <event2/event.h>
-#include <event2/thread.h>
+#include <sys/queue.h>
 
 #include "evthr.h"
 
@@ -28,14 +27,19 @@
 
 typedef struct evthr_cmd        evthr_cmd_t;
 typedef struct evthr_pool_slist evthr_pool_slist_t;
+typedef struct evthr_queue      evthr_queue_t;
+typedef struct evthr_work_item  evthr_work_item_t;
 
 struct evthr_cmd {
-    uint8_t  stop : 1;
+    STAILQ_ENTRY(evthr_cmd) next;
     void   * args;
     evthr_cb cb;
-} __attribute__ ((packed));
+    uint8_t  stop : 1;
+};
 
 TAILQ_HEAD(evthr_pool_slist, evthr);
+
+STAILQ_HEAD(evthr_queue, evthr_cmd);
 
 struct evthr_pool {
     int                nthreads;
@@ -45,14 +49,16 @@ struct evthr_pool {
 struct evthr {
     int             cur_backlog;
     int             max_backlog;
-    int             rdr;
-    int             wdr;
     char            err;
-    ev_t          * event;
-    evbase_t      * evbase;
+
+    evthr_queue_t   queue;
+
+    pthread_cond_t  cond; /* protected by rlock */
+
     pthread_mutex_t lock;
     pthread_mutex_t stat_lock;
     pthread_mutex_t rlock;
+
     pthread_t     * thr;
     evthr_init_cb   init_cb;
     void          * arg;
@@ -81,73 +87,10 @@ evthr_set_max_backlog(evthr_t * evthr, int max) {
     evthr->max_backlog = max;
 }
 
-static void
-_evthr_read_cmd(int sock, short __unused__ which, void * args) {
-    evthr_t   * thread;
-    evthr_cmd_t cmd;
-    int         avail = 0;
-    ssize_t     recvd;
-
-    if (!(thread = (evthr_t *)args)) {
-        return;
-    }
-
-    if (pthread_mutex_trylock(&thread->lock) != 0) {
-        return;
-    }
-
-    pthread_mutex_lock(&thread->rlock);
-
-    if ((recvd = recv(sock, &cmd, sizeof(evthr_cmd_t), 0)) <= 0) {
-        pthread_mutex_unlock(&thread->rlock);
-        if (errno == EAGAIN) {
-            goto end;
-        } else {
-            goto error;
-        }
-    }
-
-    if (recvd < sizeof(evthr_cmd_t)) {
-        goto error;
-    }
-
-    pthread_mutex_unlock(&thread->rlock);
-
-    if (recvd != sizeof(evthr_cmd_t)) {
-        goto error;
-    }
-
-    if (cmd.stop == 1) {
-        goto stop;
-    }
-
-    if (cmd.cb != NULL) {
-        cmd.cb(thread, cmd.args, thread->arg);
-        goto done;
-    } else {
-        goto done;
-    }
-
-stop:
-    event_base_loopbreak(thread->evbase);
-done:
-    evthr_dec_backlog(thread);
-end:
-    pthread_mutex_unlock(&thread->lock);
-    return;
-error:
-    pthread_mutex_lock(&thread->stat_lock);
-    thread->cur_backlog = -1;
-    thread->err         = 1;
-    pthread_mutex_unlock(&thread->stat_lock);
-    pthread_mutex_unlock(&thread->lock);
-    event_base_loopbreak(thread->evbase);
-    return;
-} /* _evthr_read_cmd */
-
 static void *
 _evthr_loop(void * args) {
     evthr_t * thread;
+    evthr_cmd_t *cmd;
 
     if (!(thread = (evthr_t *)args)) {
         return NULL;
@@ -157,19 +100,31 @@ _evthr_loop(void * args) {
         pthread_exit(NULL);
     }
 
-    thread->evbase = event_base_new();
-    thread->event  = event_new(thread->evbase, thread->rdr,
-                               EV_READ | EV_PERSIST, _evthr_read_cmd, args);
-
-    event_add(thread->event, NULL);
-
     pthread_mutex_lock(&thread->lock);
     if (thread->init_cb != NULL) {
         thread->init_cb(thread, thread->arg);
     }
-    pthread_mutex_unlock(&thread->lock);
 
-    event_base_loop(thread->evbase, 0);
+    pthread_mutex_lock(&thread->rlock);
+    while (pthread_cond_wait(&thread->cond, &thread->rlock) == 0) {
+        while ((cmd = STAILQ_FIRST(&thread->queue))) {
+
+            STAILQ_REMOVE_HEAD(&thread->queue, next);
+            if (cmd->stop == 1)
+                break;
+            pthread_mutex_unlock(&thread->rlock);
+
+            if (cmd->cb != NULL) {
+                cmd->cb(thread, cmd->args, thread->arg);
+            }
+            evthr_dec_backlog(thread);
+
+            pthread_mutex_lock(&thread->rlock);
+        }
+    }
+
+    pthread_mutex_unlock(&thread->rlock);
+    pthread_mutex_unlock(&thread->lock);
 
     if (thread->err == 1) {
         fprintf(stderr, "FATAL ERROR!\n");
@@ -182,7 +137,7 @@ _evthr_loop(void * args) {
 evthr_res
 evthr_defer(evthr_t * thread, evthr_cb cb, void * arg) {
     int         cur_backlog;
-    evthr_cmd_t cmd;
+    evthr_cmd_t *cmd;
 
     cur_backlog = evthr_get_backlog(thread);
 
@@ -196,20 +151,19 @@ evthr_defer(evthr_t * thread, evthr_cb cb, void * arg) {
         return EVTHR_RES_FATAL;
     }
 
+    cmd = malloc(sizeof(*cmd));
     /* cmd.magic = _EVTHR_MAGIC; */
-    cmd.cb   = cb;
-    cmd.args = arg;
-    cmd.stop = 0;
+    cmd->cb   = cb;
+    cmd->args = arg;
+    cmd->stop = 0;
 
     pthread_mutex_lock(&thread->rlock);
 
     evthr_inc_backlog(thread);
 
-    if (send(thread->wdr, &cmd, sizeof(cmd), 0) <= 0) {
-        evthr_dec_backlog(thread);
-        pthread_mutex_unlock(&thread->rlock);
-        return EVTHR_RES_RETRY;
-    }
+    STAILQ_INSERT_TAIL(&thread->queue, cmd, next);
+
+    pthread_cond_signal(&thread->cond);
 
     pthread_mutex_unlock(&thread->rlock);
 
@@ -218,28 +172,22 @@ evthr_defer(evthr_t * thread, evthr_cb cb, void * arg) {
 
 evthr_res
 evthr_stop(evthr_t * thread) {
-    evthr_cmd_t cmd;
+    evthr_cmd_t *cmd = malloc(sizeof(*cmd));
 
     /* cmd.magic = _EVTHR_MAGIC; */
-    cmd.cb   = NULL;
-    cmd.args = NULL;
-    cmd.stop = 1;
+    cmd->cb   = NULL;
+    cmd->args = NULL;
+    cmd->stop = 1;
 
     pthread_mutex_lock(&thread->rlock);
 
-    if (write(thread->wdr, &cmd, sizeof(evthr_cmd_t)) < 0) {
-        pthread_mutex_unlock(&thread->rlock);
-        return EVTHR_RES_RETRY;
-    }
+    STAILQ_INSERT_TAIL(&thread->queue, cmd, next);
+
+    pthread_cond_signal(&thread->cond);
 
     pthread_mutex_unlock(&thread->rlock);
 
     return EVTHR_RES_OK;
-}
-
-evbase_t *
-evthr_get_base(evthr_t * thr) {
-    return thr->evbase;
 }
 
 void
@@ -255,24 +203,15 @@ evthr_get_aux(evthr_t * thr) {
 evthr_t *
 evthr_new(evthr_init_cb init_cb, void * args) {
     evthr_t * thread;
-    int       fds[2];
 
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == -1) {
-        return NULL;
-    }
-
-    evutil_make_socket_nonblocking(fds[0]);
-    evutil_make_socket_nonblocking(fds[1]);
-
-    if (!(thread = calloc(sizeof(evthr_t), sizeof(char)))) {
+    if (!(thread = calloc(sizeof(evthr_t), 1))) {
         return NULL;
     }
 
     thread->thr     = malloc(sizeof(pthread_t));
     thread->init_cb = init_cb;
     thread->arg     = args;
-    thread->rdr     = fds[0];
-    thread->wdr     = fds[1];
+    STAILQ_INIT(&thread->queue);
 
     if (pthread_mutex_init(&thread->lock, NULL)) {
         evthr_free(thread);
@@ -285,6 +224,11 @@ evthr_new(evthr_init_cb init_cb, void * args) {
     }
 
     if (pthread_mutex_init(&thread->rlock, NULL)) {
+        evthr_free(thread);
+        return NULL;
+    }
+
+    if (pthread_cond_init(&thread->cond, NULL)) {
         evthr_free(thread);
         return NULL;
     }
@@ -315,25 +259,13 @@ evthr_free(evthr_t * thread) {
         return;
     }
 
-    if (thread->rdr > 0) {
-        close(thread->rdr);
-    }
-
-    if (thread->wdr > 0) {
-        close(thread->wdr);
-    }
-
     if (thread->thr) {
         free(thread->thr);
     }
 
-    if (thread->event) {
-        event_free(thread->event);
-    }
+    /* XXX what about pthread_mutex_destroy?? */
 
-    if (thread->evbase) {
-        event_base_free(thread->evbase);
-    }
+    pthread_cond_destroy(&thread->cond);
 
     free(thread);
 } /* evthr_free */
